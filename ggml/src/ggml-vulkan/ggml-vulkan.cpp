@@ -254,6 +254,7 @@ enum vk_device_architecture {
     AMD_RDNA3,
     INTEL_XE2,
     NVIDIA_PRE_TURING,
+    NVIDIA_TURING,
 };
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
@@ -336,17 +337,33 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
         const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
 
         bool cooperative_matrix = false;
+        bool sm_builtins = false;
 
         // Detect "pre-turing" based on lack of coopmat support.
         for (const auto& properties : ext_props) {
             if (strcmp("VK_KHR_cooperative_matrix", properties.extensionName) == 0) {
                 cooperative_matrix = true;
-                break;
+            } else if (strcmp("VK_NV_shader_sm_builtins", properties.extensionName) == 0) {
+                sm_builtins = true;
             }
         }
 
         if (!cooperative_matrix) {
             return vk_device_architecture::NVIDIA_PRE_TURING;
+        }
+
+        if (sm_builtins) {
+            vk::PhysicalDeviceProperties2 props2;
+            vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV sm_props;
+
+            props2.pNext = &sm_props;
+
+            device.getProperties2(&props2);
+
+            // Turing has 32, following architectures have 48
+            if (sm_props.shaderWarpsPerSM == 32) {
+                return vk_device_architecture::NVIDIA_TURING;
+            }
         }
     }
     return vk_device_architecture::OTHER;
@@ -1246,25 +1263,30 @@ struct vk_op_diag_mask_push_constants {
 
 struct vk_op_rope_push_constants {
     uint32_t rope_mode;
-    uint32_t ncols;
     uint32_t nrows;
     uint32_t n_dims;
     float freq_scale;
-    uint32_t p_delta_rows;
     float freq_base;
     float ext_factor;
     float attn_factor;
     float corr_dims[2];
     float theta_scale;
     uint32_t has_ff;
-    uint32_t ne02;
-    uint32_t s1;
-    uint32_t s2;
     int32_t sections[4];
     uint32_t is_imrope;
     uint32_t is_back;
     uint32_t set_rows_stride;
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t ne02;
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+    uint32_t nb11;
+    uint32_t nb12;
+    uint32_t nb13;
 };
+static_assert(sizeof(vk_op_rope_push_constants) <= 128, "sizeof(vk_op_rope_push_constants) must be <= 128");
 
 // For fused rms_norm+mul+rope(+view+set_rows)
 struct vk_op_rms_norm_mul_rope_push_constants {
@@ -3182,9 +3204,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
         const uint32_t D_lsb = D ^ (D & (D-1));
         uint32_t D_split = std::min(std::min(device->subgroup_size, 8u), D_lsb / 4);
 
-        // Nvidia prefers shared memory use to load large tiles of K
+        // Nvidia prefers shared memory use to load large tiles of K.
+        // Switch to loading from global memory when it would use too much shared memory.
         // AMD prefers loading K directly from global memory
-        const uint32_t k_load_shmem = device->vendor_id == VK_VENDOR_ID_NVIDIA ? 1 : 0;
+        const uint32_t k_load_shmem = device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 ? 1 : 0;
 
         return {wg_size, rows_cols[0], rows_cols[1], hsk, hsv, clamp, D_split, device->subgroup_size, k_load_shmem};
     };
@@ -8390,7 +8413,7 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t sfshstride = (hsk <= 128) ? (Br + 8) : Br;
     const uint32_t sfsh = Bc * sfshstride * acctype;
 
-    const bool k_load_shmem = device->vendor_id == VK_VENDOR_ID_NVIDIA;
+    const bool k_load_shmem = device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256;
     const uint32_t kshstride = (k_load_shmem ? hsk_pad : MatBr) / 4 + 2;
     const uint32_t vsh_stride = MatBc / 4 * row_split;
     const uint32_t ksh = ((kshstride >= vsh_stride) ? (Bc * kshstride) : (Bc * vsh_stride)) * f16vec4;
@@ -8459,6 +8482,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     FaCodePath path = ctx->device->coopmat2 ? FA_COOPMAT2 :
                       ctx->device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
+
+    if (path == FA_COOPMAT1 && ctx->device->architecture == vk_device_architecture::NVIDIA_TURING) {
+        // Nvidia compiler bug, see https://github.com/ggml-org/llama.cpp/pull/19075#issuecomment-3820716090
+        path = FA_SCALAR;
+    }
 
     if (path == FA_COOPMAT1) {
         const bool coopmat_shape_supported = (dst->op_params[3] == GGML_PREC_F32 && ctx->device->coopmat_support_16x16x16_f32acc) ||
@@ -10383,12 +10411,22 @@ static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *
 
     uint32_t nb01 = src0->nb[1] / ggml_type_size(src0->type);
     uint32_t nb02 = src0->nb[2] / ggml_type_size(src0->type);
+    uint32_t nb03 = src0->nb[3] / ggml_type_size(src0->type);
+
+    uint32_t nb11 = dst->nb[1] / ggml_type_size(dst->type);
+    uint32_t nb12 = dst->nb[2] / ggml_type_size(dst->type);
+    uint32_t nb13 = dst->nb[3] / ggml_type_size(dst->type);
 
     vk_op_rope_push_constants rope {
-        (uint32_t)mode, (uint32_t)src0->ne[0], (uint32_t)ggml_nrows(src0), (uint32_t)n_dims, freq_scale, (uint32_t)src0->ne[1],
-        freq_base, ext_factor, attn_factor, {corr_dims[0], corr_dims[1]}, theta_scale,
-        has_ff, (uint32_t)src0->ne[2], nb01, nb02,
+        (uint32_t)mode, (uint32_t)ggml_nrows(src0), (uint32_t)n_dims, freq_scale,
+        freq_base, ext_factor, attn_factor, {corr_dims[0], corr_dims[1]}, theta_scale, has_ff,
         { sections[0], sections[1], sections[2], sections[3] }, is_imrope, backprop, set_rows_stride,
+
+        (uint32_t)src0->ne[0],
+        (uint32_t)src0->ne[1],
+        (uint32_t)src0->ne[2],
+        nb01, nb02, nb03,
+        nb11, nb12, nb13,
     };
 
     return rope;
@@ -14776,6 +14814,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_REPEAT_BACK:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_ROPE:
+            return ggml_is_contiguous_rows(op) && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_ROPE_BACK:
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
